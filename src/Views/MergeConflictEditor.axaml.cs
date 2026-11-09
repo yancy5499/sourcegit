@@ -182,14 +182,18 @@ namespace SourceGit.Views
                 if (_presenter.DataContext is not ViewModels.MergeConflictEditor vm)
                     return;
 
-                var info = GetLineAt(e);
-                if (info == null)
+                var row = GetRowAt(e);
+                if (row < 0)
+                    return;
+
+                var info = _presenter.Lines[row];
+                if (info.RegionIndex < 0)
                     return;
 
                 // The first line decides whether this drag selects or deselects.
                 _dragPickState = !vm.IsPicked(info.RegionIndex, _presenter.PanelType, info.IndexInSide, out _);
-                _lastDragLine = info;
-                vm.SetPick(info.RegionIndex, _presenter.PanelType, info.IndexInSide, _dragPickState.Value);
+                _lastDragRow = row;
+                vm.SetPicks(info.RegionIndex, _presenter.PanelType, info.IndexInSide, info.IndexInSide, _dragPickState.Value);
                 e.Pointer.Capture(this);
                 e.Handled = true;
             }
@@ -198,15 +202,10 @@ namespace SourceGit.Views
             {
                 base.OnPointerMoved(e);
 
-                if (_dragPickState is not { } state || _presenter.DataContext is not ViewModels.MergeConflictEditor vm)
+                if (_dragPickState == null)
                     return;
 
-                var info = GetLineAt(e);
-                if (info == null || info == _lastDragLine)
-                    return;
-
-                _lastDragLine = info;
-                vm.SetPick(info.RegionIndex, _presenter.PanelType, info.IndexInSide, state);
+                ApplyDragTo(GetRowAt(e));
                 e.Handled = true;
             }
 
@@ -217,8 +216,8 @@ namespace SourceGit.Views
                 if (_dragPickState == null)
                     return;
 
+                ApplyDragTo(GetRowAt(e));
                 _dragPickState = null;
-                _lastDragLine = null;
                 e.Pointer.Capture(null);
                 e.Handled = true;
             }
@@ -227,26 +226,49 @@ namespace SourceGit.Views
             {
                 base.OnPointerCaptureLost(e);
                 _dragPickState = null;
-                _lastDragLine = null;
             }
 
-            private Models.ConflictLine GetLineAt(PointerEventArgs e)
+            private void ApplyDragTo(int target)
+            {
+                if (target < 0 || target == _lastDragRow ||
+                    _dragPickState is not { } state ||
+                    _presenter.DataContext is not ViewModels.MergeConflictEditor vm)
+                    return;
+
+                var lines = _presenter.Lines;
+                var step = target > _lastDragRow ? 1 : -1;
+                for (var row = _lastDragRow + step; row != target + step; row += step)
+                {
+                    var first = lines[row];
+                    if (first.RegionIndex < 0)
+                        continue;
+
+                    // Apply one replacement per conflict block, in drag order.
+                    while (row != target && lines[row + step].RegionIndex == first.RegionIndex)
+                        row += step;
+
+                    vm.SetPicks(first.RegionIndex, _presenter.PanelType, first.IndexInSide, lines[row].IndexInSide, state);
+                }
+
+                _lastDragRow = target;
+            }
+
+            private int GetRowAt(PointerEventArgs e)
             {
                 var lines = _presenter.Lines;
                 var view = TextView;
                 if (lines == null || view is not { VisualLinesValid: true })
-                    return null;
+                    return -1;
 
                 var visualLine = view.GetVisualLineFromVisualTop(e.GetPosition(this).Y + view.VerticalOffset);
                 if (visualLine == null || visualLine.FirstDocumentLine.LineNumber > lines.Count)
-                    return null;
+                    return -1;
 
-                var info = lines[visualLine.FirstDocumentLine.LineNumber - 1];
-                return info.RegionIndex >= 0 && info.IndexInSide >= 0 ? info : null;
+                return visualLine.FirstDocumentLine.LineNumber - 1;
             }
 
             private bool? _dragPickState;
-            private Models.ConflictLine _lastDragLine;
+            private int _lastDragRow;
             private readonly MergeConflictTextPresenter _presenter;
         }
 

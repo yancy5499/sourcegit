@@ -238,23 +238,35 @@ namespace SourceGit.ViewModels
             return order >= 0;
         }
 
-        public void SetPick(int regionIdx, Models.ConflictPanelType side, int index, bool picked)
+        public void SetPicks(int regionIdx, Models.ConflictPanelType side, int first, int last, bool picked)
         {
             var r = _conflictRegions[regionIdx];
             if (r.IsCustom)
                 return;
 
-            var existing = r.Picks.FindIndex(p => p.Side == side && p.Index == index);
-            if (picked == existing >= 0)
+            var before = CaptureRegionState(regionIdx);
+            var step = first <= last ? 1 : -1;
+            var changed = false;
+            for (var index = first; index != last + step; index += step)
+            {
+                var existing = r.Picks.FindIndex(p => p.Side == side && p.Index == index);
+                if (picked && existing < 0)
+                {
+                    r.Picks.Add(new(side, index));
+                    changed = true;
+                }
+                else if (!picked && existing >= 0)
+                {
+                    r.Picks.RemoveAt(existing);
+                    changed = true;
+                }
+            }
+
+            if (!changed)
                 return;
 
-            if (existing >= 0)
-                r.Picks.RemoveAt(existing);
-            else
-                r.Picks.Add(new(side, index));
-
             r.HasChoice = r.Picks.Count > 0;
-            ApplyRegion(regionIdx);
+            ApplyRegion(before);
             CurrentConflictIndex = regionIdx;
             OnRegionsChanged();
         }
@@ -269,6 +281,7 @@ namespace SourceGit.ViewModels
 
         public void ResolveRegion(int regionIdx, Models.ConflictResolution resolution)
         {
+            var before = CaptureRegionState(regionIdx);
             var r = _conflictRegions[regionIdx];
             r.Picks.Clear();
             r.IsCustom = false;
@@ -283,7 +296,7 @@ namespace SourceGit.ViewModels
             if (resolution == Models.ConflictResolution.UseBothTheirsFirst)
                 AddAllPicks(r, Models.ConflictPanelType.Ours);
 
-            ApplyRegion(regionIdx);
+            ApplyRegion(before);
             CurrentConflictIndex = regionIdx;
             SelectedChunk = null;
             OnRegionsChanged();
@@ -553,8 +566,9 @@ namespace SourceGit.ViewModels
             return lines;
         }
 
-        private void ApplyRegion(int regionIdx)
+        private void ApplyRegion(RegionState before)
         {
+            var regionIdx = before.Index;
             var r = _conflictRegions[regionIdx];
             var range = _ranges[regionIdx];
 
@@ -567,14 +581,66 @@ namespace SourceGit.ViewModels
                 builder.Length--;
 
             var text = builder.ToString();
-            var start = range.Start.Offset;
 
+            // Keep both snapshots in the same undo group as the text replacement.
+            using var update = ResultDocument.RunUpdate();
+            ResultDocument.UndoStack.Push(new RegionUndoOperation(this, [before], true));
             _isApplying = true;
-            ResultDocument.Replace(start, range.End.Offset - start, text);
-            _isApplying = false;
+            try
+            {
+                ResultDocument.Replace(before.Start, before.End - before.Start, text);
+                SetRegionBounds(regionIdx, before.Start, before.Start + text.Length);
+            }
+            finally
+            {
+                _isApplying = false;
+            }
 
+            ResultDocument.UndoStack.Push(new RegionUndoOperation(this, [CaptureRegionState(regionIdx)], false));
+        }
+
+        private void SetRegionBounds(int regionIdx, int start, int end)
+        {
+            var range = _ranges[regionIdx];
             range.Start = CreateAnchor(start);
-            range.End = CreateAnchor(start + text.Length);
+            range.End = CreateAnchor(end);
+
+            // When an empty region gains text, following anchors at its old offset
+            // stay before the insertion. Move them out of the restored region.
+            for (var i = regionIdx + 1; i < _ranges.Count && _ranges[i].Start.Offset < end; i++)
+            {
+                var next = _ranges[i];
+                next.Start = CreateAnchor(end);
+                if (next.End.Offset < end)
+                    next.End = CreateAnchor(end);
+            }
+        }
+
+        private RegionState CaptureRegionState(int index)
+        {
+            var r = _conflictRegions[index];
+            var range = _ranges[index];
+            return new(index, range.Start.Offset, range.End.Offset, r.IsCustom, r.HasChoice,
+                r.Picks.ToArray(), range.LineTypes.ToArray());
+        }
+
+        private void RestoreRegionStates(IReadOnlyList<RegionState> states)
+        {
+            foreach (var state in states)
+            {
+                SetRegionBounds(state.Index, state.Start, state.End);
+                var r = _conflictRegions[state.Index];
+                r.IsCustom = state.IsCustom;
+                r.HasChoice = state.HasChoice;
+                r.Picks.Clear();
+                r.Picks.AddRange(state.Picks);
+                var types = _ranges[state.Index].LineTypes;
+                types.Clear();
+                types.AddRange(state.LineTypes);
+            }
+
+            _isApplying = false;
+            OnRegionsChanged();
         }
 
         private void AddAllPicks(Models.ConflictRegion r, Models.ConflictPanelType side)
@@ -607,6 +673,9 @@ namespace SourceGit.ViewModels
                 if (removed || inserted)
                     _touchedRegions.Add(i);
             }
+
+            if (_touchedRegions.Count > 0)
+                ResultDocument.UndoStack.Push(new RegionUndoOperation(this, _touchedRegions.ConvertAll(CaptureRegionState), true));
         }
 
         private void OnResultDocumentChanged(object sender, DocumentChangeEventArgs e)
@@ -622,6 +691,9 @@ namespace SourceGit.ViewModels
                 r.Picks.Clear();
                 _ranges[i].LineTypes.Clear();
             }
+
+            if (_touchedRegions.Count > 0)
+                ResultDocument.UndoStack.Push(new RegionUndoOperation(this, _touchedRegions.ConvertAll(CaptureRegionState), false));
 
             _touchedRegions.Clear();
             OnRegionsChanged();
@@ -678,6 +750,24 @@ namespace SourceGit.ViewModels
             }
 
             return false;
+        }
+
+        private sealed record RegionState(int Index, int Start, int End, bool IsCustom, bool HasChoice,
+            Models.ConflictPick[] Picks, Models.ConflictLineType[] LineTypes);
+
+        private sealed class RegionUndoOperation(
+            MergeConflictEditor editor, IReadOnlyList<RegionState> states, bool before) : IUndoableOperation
+        {
+            public void Undo() => Replay(before);
+            public void Redo() => Replay(!before);
+
+            private void Replay(bool restore)
+            {
+                if (restore)
+                    editor.RestoreRegionStates(states);
+                else
+                    editor._isApplying = true;
+            }
         }
 
         private class RegionRange
