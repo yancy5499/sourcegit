@@ -130,6 +130,7 @@
 
           <Grid Margin="{TemplateBinding Padding}" Effect="drop-shadow(0 0 12 #60000000)">
             <Border x:Name="PART_ContentRoot"
+                    Margin="{TemplateBinding OffScreenMargin}"
                     Background="{DynamicResource Brush.Window}"
                     BorderBrush="{DynamicResource Brush.WindowBorder}"
                     BorderThickness="1"
