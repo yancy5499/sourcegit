@@ -52,6 +52,9 @@ namespace SourceGit.Native
             window.ExtendClientAreaToDecorationsHint = true;
             window.BorderThickness = new Thickness(1);
             window.Padding = new Thickness(0);
+
+            if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+                Win32Properties.AddWndProcHookCallback(window, Win64Utilities.ClampMaximizedClientArea);
         }
 
         public OS.Directories GetOrCreateDirectories()
@@ -445,12 +448,64 @@ namespace SourceGit.Native
         [DllImport("dwmapi.dll")]
         private static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref MARGINS margins);
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left, Top, Right, Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MONITORINFO
+        {
+            public int Size;
+            public RECT Monitor;
+            public RECT Work;
+            public uint Flags;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool IsZoomed(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromRect(ref RECT rect, uint flags);
+
+        [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW")]
+        private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+        internal static IntPtr ClampMaximizedClientArea(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            const uint WM_NCCALCSIZE = 0x0083;
+            const uint MONITOR_DEFAULTTONEAREST = 2;
+            if (message != WM_NCCALCSIZE || wParam == IntPtr.Zero || !IsZoomed(hwnd))
+                return IntPtr.Zero;
+
+            // Avalonia extends the client area over the entire window rectangle.
+            // On Windows 10 that rectangle can include borders outside the work area.
+            var rect = Marshal.PtrToStructure<RECT>(lParam);
+            var monitor = MonitorFromRect(ref rect, MONITOR_DEFAULTTONEAREST);
+            var info = new MONITORINFO { Size = Marshal.SizeOf<MONITORINFO>() };
+            if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info))
+                return IntPtr.Zero;
+
+            rect.Left = Math.Max(rect.Left, info.Work.Left);
+            rect.Top = Math.Max(rect.Top, info.Work.Top);
+            rect.Right = Math.Min(rect.Right, info.Work.Right);
+            rect.Bottom = Math.Min(rect.Bottom, info.Work.Bottom);
+            if (rect.Right <= rect.Left || rect.Bottom <= rect.Top)
+                return IntPtr.Zero;
+
+            Marshal.StructureToPtr(rect, lParam, false);
+            handled = true;
+            return IntPtr.Zero;
+        }
+
         public static void FixWindowFrame(Window w)
         {
+            var isWindows11OrLater = OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000);
             if (w.WindowState == WindowState.Maximized)
             {
                 w.BorderThickness = new Thickness(0);
-                w.Padding = new Thickness(8, 6, 8, 8);
+                w.Padding = isWindows11OrLater ? new Thickness(8, 6, 8, 8) : new Thickness(0);
             }
             else
             {
@@ -458,7 +513,7 @@ namespace SourceGit.Native
                 w.Padding = new Thickness(0);
             }
 
-            if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+            if (isWindows11OrLater)
                 return;
 
             Dispatcher.UIThread.Post(() =>
